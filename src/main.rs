@@ -1,16 +1,25 @@
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use yt_dlp::fetcher::deps::Libraries;
 use yt_dlp::Youtube;
+use futures::stream::{self, StreamExt};
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match first_check().await {
         Ok(fetcher) => {
+            // Create a shared reference to fetcher
+            let fetcher = Arc::new(fetcher);
+            
             // Read URLs from any .txt file in input directory
             let input_dir = PathBuf::from("input");
             let entries = std::fs::read_dir(input_dir)?;
+
+            // Limit concurrent downloads
+            let semaphore = Arc::new(Semaphore::new(3)); // Adjust number of concurrent downloads
 
             for entry in entries {
                 let entry = entry?;
@@ -20,14 +29,27 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Processing file: {:?}", path);
                     let urls = read_urls(&path)?;
 
-                    for (index, url) in urls.iter().enumerate() {
-                        println!("Processing video {}/{}: {}", index + 1, urls.len(), url);
+                    // Process URLs concurrently
+                    let download_tasks = stream::iter(urls.into_iter().enumerate())
+                        .map(|(index, url)| {
+                            let fetcher = Arc::clone(&fetcher);
+                            let sem = Arc::clone(&semaphore);
+                            
+                            async move {
+                                // Acquire semaphore permit
+                                let _permit = sem.acquire().await.unwrap();
+                                
+                                println!("Starting download for video {}", index + 1);
+                                match download_video(&fetcher, url.clone(), index).await {
+                                    Ok(_) => println!("Successfully downloaded video {}", index + 1),
+                                    Err(e) => eprintln!("Failed to download video {}: {}", index + 1, e),
+                                }
+                            }
+                        })
+                        .buffer_unordered(10); // Maximum number of concurrent tasks
 
-                        match download_video(&fetcher, url.to_string(), index).await {
-                            Ok(_) => println!("Successfully downloaded video {}", index + 1),
-                            Err(e) => eprintln!("Failed to download video {}: {}", index + 1, e),
-                        }
-                    }
+                    // Wait for all downloads to complete
+                    download_tasks.collect::<Vec<_>>().await;
                 }
             }
         }
@@ -72,10 +94,10 @@ async fn download_video(
         .await?;
 
     // Clean up temporary files from output directory
-    if let Err(e) = std::fs::remove_file( format!("output/{}",&audio_filename)) {
+    if let Err(e) = std::fs::remove_file(format!("output/{}", &audio_filename)) {
         eprintln!("Warning: Could not delete temporary audio file: {}", e);
     }
-    if let Err(e) = std::fs::remove_file(format!("output/{}",&video_filename)) {
+    if let Err(e) = std::fs::remove_file(format!("output/{}", &video_filename)) {
         eprintln!("Warning: Could not delete temporary video file: {}", e);
     }
 
