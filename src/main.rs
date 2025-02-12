@@ -2,24 +2,69 @@ use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::time::{Duration, Instant};
+use tokio::sync::{Semaphore, Mutex};
 use yt_dlp::fetcher::deps::Libraries;
 use yt_dlp::Youtube;
 use futures::stream::{self, StreamExt};
+
+// Structure to track download progress
+struct DownloadProgress {
+    total_videos: usize,
+    completed: usize,
+    start_time: Instant,
+    errors: usize,
+}
+
+impl DownloadProgress {
+    fn new(total_videos: usize) -> Self {
+        Self {
+            total_videos,
+            completed: 0,
+            start_time: Instant::now(),
+            errors: 0,
+        }
+    }
+
+    fn update(&mut self, success: bool) {
+        self.completed += 1;
+        if !success {
+            self.errors += 1;
+        }
+        self.print_progress();
+    }
+
+    fn print_progress(&self) {
+        let elapsed = self.start_time.elapsed();
+        let avg_time_per_video = if self.completed > 0 {
+            elapsed.div_f64(self.completed as f64)
+        } else {
+            Duration::from_secs(0)
+        };
+
+        let remaining_videos = self.total_videos - self.completed;
+        let est_remaining_time = avg_time_per_video.mul_f64(remaining_videos as f64);
+
+        println!("Progress: {}/{} videos completed ({:.1}%)", 
+            self.completed, 
+            self.total_videos,
+            (self.completed as f64 / self.total_videos as f64) * 100.0
+        );
+        println!("Elapsed time: {:.1}s", elapsed.as_secs_f64());
+        println!("Estimated time remaining: {:.1}s", est_remaining_time.as_secs_f64());
+        println!("Successful: {}, Failed: {}", self.completed - self.errors, self.errors);
+        println!("----------------------------------------");
+    }
+}
 
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match first_check().await {
         Ok(fetcher) => {
-            // Create a shared reference to fetcher
             let fetcher = Arc::new(fetcher);
-            
-            // Read URLs from any .txt file in input directory
             let input_dir = PathBuf::from("input");
             let entries = std::fs::read_dir(input_dir)?;
-
-            // Limit concurrent downloads
-            let semaphore = Arc::new(Semaphore::new(3)); // Adjust number of concurrent downloads
+            let semaphore = Arc::new(Semaphore::new(3));
 
             for entry in entries {
                 let entry = entry?;
@@ -28,28 +73,44 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if path.extension().and_then(|ext| ext.to_str()) == Some("txt") {
                     println!("Processing file: {:?}", path);
                     let urls = read_urls(&path)?;
+                    let total_videos = urls.len();
+                    
+                    println!("Found {} videos to download", total_videos);
+                    let progress = Arc::new(Mutex::new(DownloadProgress::new(total_videos)));
 
-                    // Process URLs concurrently
                     let download_tasks = stream::iter(urls.into_iter().enumerate())
                         .map(|(index, url)| {
                             let fetcher = Arc::clone(&fetcher);
                             let sem = Arc::clone(&semaphore);
+                            let progress = Arc::clone(&progress);
                             
                             async move {
-                                // Acquire semaphore permit
                                 let _permit = sem.acquire().await.unwrap();
-                                
                                 println!("Starting download for video {}", index + 1);
-                                match download_video(&fetcher, url.clone(), index).await {
-                                    Ok(_) => println!("Successfully downloaded video {}", index + 1),
+                                
+                                let start = Instant::now();
+                                let result = download_video(&fetcher, url.clone(), index).await;
+                                let duration = start.elapsed();
+                                
+                                let success = result.is_ok();
+                                progress.lock().await.update(success);
+                                
+                                match result {
+                                    Ok(_) => println!("Video {} completed in {:.1}s", index + 1, duration.as_secs_f64()),
                                     Err(e) => eprintln!("Failed to download video {}: {}", index + 1, e),
                                 }
                             }
                         })
-                        .buffer_unordered(10); // Maximum number of concurrent tasks
+                        .buffer_unordered(10);
 
-                    // Wait for all downloads to complete
                     download_tasks.collect::<Vec<_>>().await;
+                    
+                    // Print final statistics
+                    let final_progress = progress.lock().await;
+                    println!("\nDownload Summary:");
+                    println!("Total time: {:.1}s", final_progress.start_time.elapsed().as_secs_f64());
+                    println!("Successfully downloaded: {}", final_progress.completed - final_progress.errors);
+                    println!("Failed downloads: {}", final_progress.errors);
                 }
             }
         }
