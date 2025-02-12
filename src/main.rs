@@ -7,6 +7,10 @@ use tokio::sync::{Semaphore, Mutex};
 use yt_dlp::fetcher::deps::Libraries;
 use yt_dlp::Youtube;
 use futures::stream::{self, StreamExt};
+use csv::ReaderBuilder;
+use serde::Deserialize;
+use url::Url;
+use reqwest;
 
 // Structure to track download progress
 struct DownloadProgress {
@@ -57,14 +61,81 @@ impl DownloadProgress {
     }
 }
 
+// Structure to hold sheet data
+#[derive(Debug, Deserialize)]
+struct SheetRow {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default, rename = "")]
+    _extra: Vec<String>, // This will catch any extra fields
+}
+
+async fn fetch_sheet_urls() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let url = Url::parse("https://docs.google.com/spreadsheets/d/160Obd-Z9nMz2LfnbqUVvvwCvel7AGfjwREZtVwtM1_M/edit#gid=0")?;
+    let segments: Vec<&str> = url.path_segments().unwrap().collect();
+    let sheet_id = segments.get(2).ok_or("error")?;
+    let csv_url = format!(
+        "https://docs.google.com/spreadsheets/d/{}/export?format=csv&gid=0",
+        sheet_id
+    );
+
+    println!("Fetching data from URL: {}", csv_url);
+
+    // Fetch CSV data with error handling
+    let response = reqwest::get(&csv_url).await.map_err(|e| {
+        format!("Failed to fetch sheet: {}", e)
+    })?;
+
+    if !response.status().is_success() {
+        return Err(format!("Failed to fetch sheet. Status: {}", response.status()).into());
+    }
+
+    let content = response.text().await.map_err(|e| {
+        format!("Failed to read response content: {}", e)
+    })?;
+
+    println!("Received content length: {} bytes", content.len());
+
+    // Simple parsing: split by lines and take non-empty URLs
+    let urls: Vec<String> = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .collect();
+
+    if urls.is_empty() {
+        return Err("No valid URLs found in the sheet".into());
+    }
+
+    println!("Successfully loaded {} URLs from sheet", urls.len());
+    
+    // Print first few URLs for debugging
+    for (i, url) in urls.iter().take(3).enumerate() {
+        println!("URL {}: {}", i + 1, url);
+    }
+
+    Ok(urls)
+}
+
 #[tokio::main]
 pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match first_check().await {
         Ok(fetcher) => {
             let fetcher = Arc::new(fetcher);
+            let semaphore = Arc::new(Semaphore::new(3));
+
+            println!("Reading URLs from Google Sheet...");
+            match fetch_sheet_urls().await {
+                Ok(urls) => {
+                    process_urls(&fetcher, &semaphore, urls).await?;
+                }
+                Err(e) => eprintln!("Failed to fetch from Google Sheet: {}", e),
+            }
+            // Then process local files
             let input_dir = PathBuf::from("input");
             let entries = std::fs::read_dir(input_dir)?;
-            let semaphore = Arc::new(Semaphore::new(3));
 
             for entry in entries {
                 let entry = entry?;
@@ -73,44 +144,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if path.extension().and_then(|ext| ext.to_str()) == Some("txt") {
                     println!("Processing file: {:?}", path);
                     let urls = read_urls(&path)?;
-                    let total_videos = urls.len();
-                    
-                    println!("Found {} videos to download", total_videos);
-                    let progress = Arc::new(Mutex::new(DownloadProgress::new(total_videos)));
-
-                    let download_tasks = stream::iter(urls.into_iter().enumerate())
-                        .map(|(index, url)| {
-                            let fetcher = Arc::clone(&fetcher);
-                            let sem = Arc::clone(&semaphore);
-                            let progress = Arc::clone(&progress);
-                            
-                            async move {
-                                let _permit = sem.acquire().await.unwrap();
-                                println!("Starting download for video {}", index + 1);
-                                
-                                let start = Instant::now();
-                                let result = download_video(&fetcher, url.clone(), index).await;
-                                let duration = start.elapsed();
-                                
-                                let success = result.is_ok();
-                                progress.lock().await.update(success);
-                                
-                                match result {
-                                    Ok(_) => println!("Video {} completed in {:.1}s", index + 1, duration.as_secs_f64()),
-                                    Err(e) => eprintln!("Failed to download video {}: {}", index + 1, e),
-                                }
-                            }
-                        })
-                        .buffer_unordered(10);
-
-                    download_tasks.collect::<Vec<_>>().await;
-                    
-                    // Print final statistics
-                    let final_progress = progress.lock().await;
-                    println!("\nDownload Summary:");
-                    println!("Total time: {:.1}s", final_progress.start_time.elapsed().as_secs_f64());
-                    println!("Successfully downloaded: {}", final_progress.completed - final_progress.errors);
-                    println!("Failed downloads: {}", final_progress.errors);
+                    process_urls(&fetcher, &semaphore, urls).await?;
                 }
             }
         }
@@ -223,4 +257,51 @@ async fn first_check() -> Result<Youtube, yt_dlp::error::Error> {
     }
 
     Ok(fetcher)
+}
+
+// New function to handle URL processing
+async fn process_urls(
+    fetcher: &Arc<Youtube>,
+    semaphore: &Arc<Semaphore>,
+    urls: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let total_videos = urls.len();
+    println!("Found {} videos to download", total_videos);
+    let progress = Arc::new(Mutex::new(DownloadProgress::new(total_videos)));
+
+    let download_tasks = stream::iter(urls.into_iter().enumerate())
+        .map(|(index, url)| {
+            let fetcher = Arc::clone(fetcher);
+            let sem = Arc::clone(semaphore);
+            let progress = Arc::clone(&progress);
+            
+            async move {
+                let _permit = sem.acquire().await.unwrap();
+                println!("Starting download for video {}", index + 1);
+                
+                let start = Instant::now();
+                let result = download_video(&fetcher, url.clone(), index).await;
+                let duration = start.elapsed();
+                
+                let success = result.is_ok();
+                progress.lock().await.update(success);
+                
+                match result {
+                    Ok(_) => println!("Video {} completed in {:.1}s", index + 1, duration.as_secs_f64()),
+                    Err(e) => eprintln!("Failed to download video {}: {}", index + 1, e),
+                }
+            }
+        })
+        .buffer_unordered(10);
+
+    download_tasks.collect::<Vec<_>>().await;
+    
+    // Print final statistics
+    let final_progress = progress.lock().await;
+    println!("\nDownload Summary:");
+    println!("Total time: {:.1}s", final_progress.start_time.elapsed().as_secs_f64());
+    println!("Successfully downloaded: {}", final_progress.completed - final_progress.errors);
+    println!("Failed downloads: {}", final_progress.errors);
+
+    Ok(())
 }
