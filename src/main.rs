@@ -1,205 +1,154 @@
+use application::error::Result;
+use application::{Config, Downloader, SheetClient};
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, Mutex};
-use yt_dlp::fetcher::deps::Libraries;
-use yt_dlp::Youtube;
-use futures::stream::{self, StreamExt};
-use csv::ReaderBuilder;
-use serde::Deserialize;
-use url::Url;
-use reqwest;
+use tracing::{error, info};
 
-// Structure to track download progress
-struct DownloadProgress {
-    total_videos: usize,
-    completed: usize,
-    start_time: Instant,
-    errors: usize,
-}
-
-impl DownloadProgress {
-    fn new(total_videos: usize) -> Self {
-        Self {
-            total_videos,
-            completed: 0,
-            start_time: Instant::now(),
-            errors: 0,
-        }
-    }
-
-    fn update(&mut self, success: bool) {
-        self.completed += 1;
-        if !success {
-            self.errors += 1;
-        }
-        self.print_progress();
-    }
-
-    fn print_progress(&self) {
-        let elapsed = self.start_time.elapsed();
-        let avg_time_per_video = if self.completed > 0 {
-            elapsed.div_f64(self.completed as f64)
-        } else {
-            Duration::from_secs(0)
-        };
-
-        let remaining_videos = self.total_videos - self.completed;
-        let est_remaining_time = avg_time_per_video.mul_f64(remaining_videos as f64);
-
-        println!("Progress: {}/{} videos completed ({:.1}%)", 
-            self.completed, 
-            self.total_videos,
-            (self.completed as f64 / self.total_videos as f64) * 100.0
-        );
-        println!("Elapsed time: {:.1}s", elapsed.as_secs_f64());
-        println!("Estimated time remaining: {:.1}s", est_remaining_time.as_secs_f64());
-        println!("Successful: {}, Failed: {}", self.completed - self.errors, self.errors);
-        println!("----------------------------------------");
-    }
-}
-
-// Structure to hold sheet data
-#[derive(Debug, Deserialize)]
-struct SheetRow {
-    #[serde(default)]
-    url: String,
-    #[serde(default)]
-    status: String,
-    #[serde(default, rename = "")]
-    _extra: Vec<String>, // This will catch any extra fields
-}
-
-async fn fetch_sheet_urls() -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let url = Url::parse("https://docs.google.com/spreadsheets/d/160Obd-Z9nMz2LfnbqUVvvwCvel7AGfjwREZtVwtM1_M/edit#gid=0")?;
-    let segments: Vec<&str> = url.path_segments().unwrap().collect();
-    let sheet_id = segments.get(2).ok_or("error")?;
-    let csv_url = format!(
-        "https://docs.google.com/spreadsheets/d/{}/export?format=csv&gid=0",
-        sheet_id
-    );
-
-    println!("Fetching data from URL: {}", csv_url);
-
-    // Fetch CSV data with error handling
-    let response = reqwest::get(&csv_url).await.map_err(|e| {
-        format!("Failed to fetch sheet: {}", e)
-    })?;
-
-    if !response.status().is_success() {
-        return Err(format!("Failed to fetch sheet. Status: {}", response.status()).into());
-    }
-
-    let content = response.text().await.map_err(|e| {
-        format!("Failed to read response content: {}", e)
-    })?;
-
-    println!("Received content length: {} bytes", content.len());
-
-    // Simple parsing: split by lines and take non-empty URLs
-    let urls: Vec<String> = content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string())
-        .collect();
-
-    if urls.is_empty() {
-        return Err("No valid URLs found in the sheet".into());
-    }
-
-    println!("Successfully loaded {} URLs from sheet", urls.len());
-    
-    // Print first few URLs for debugging
-    for (i, url) in urls.iter().take(3).enumerate() {
-        println!("URL {}: {}", i + 1, url);
-    }
-
-    Ok(urls)
-}
-
+/// Main entry point for the application.
+///
+/// # Steps
+/// 1. Initializes logging with file, line numbers and thread IDs
+/// 2. Creates a default configuration
+/// 3. Initializes the downloader with required directories
+/// 4. Runs the main application logic
+///
+/// # Errors
+/// Returns error if:
+/// - Logging initialization fails
+/// - Downloader creation fails
+/// - Application processing fails
 #[tokio::main]
-pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    match first_check().await {
-        Ok(fetcher) => {
-            let fetcher = Arc::new(fetcher);
-            let semaphore = Arc::new(Semaphore::new(3));
+async fn main() -> Result<()> {
+    info!("Starting application...");
 
-            println!("Reading URLs from Google Sheet...");
-            match fetch_sheet_urls().await {
-                Ok(urls) => {
-                    process_urls(&fetcher, &semaphore, urls).await?;
-                }
-                Err(e) => eprintln!("Failed to fetch from Google Sheet: {}", e),
-            }
-            // Then process local files
-            let input_dir = PathBuf::from("input");
-            let entries = std::fs::read_dir(input_dir)?;
+    let config = Config::default();
+    let downloader = Downloader::new(config).await?;
 
-            for entry in entries {
-                let entry = entry?;
-                let path = entry.path();
-
-                if path.extension().and_then(|ext| ext.to_str()) == Some("txt") {
-                    println!("Processing file: {:?}", path);
-                    let urls = read_urls(&path)?;
-                    process_urls(&fetcher, &semaphore, urls).await?;
-                }
-            }
-        }
-        Err(e) => eprintln!("Failed to initialize: {}", e),
+    if let Err(e) = run_application(&downloader).await {
+        error!("Application error: {}", e);
+        std::process::exit(1);
     }
 
+    info!("Application completed successfully");
     Ok(())
 }
 
-async fn download_video(
-    fetcher: &Youtube,
-    url: String,
-    index: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let video = fetcher.fetch_video_infos(url.clone()).await?;
+/// Orchestrates concurrent processing of video downloads from multiple sources.
+///
+/// # Processing Flow
+/// 1. Creates a vector of concurrent tasks
+/// 2. If configured, adds Google Sheet processing task
+/// 3. Adds local file processing task
+/// 4. Executes all tasks concurrently
+///
+/// # Arguments
+/// * `downloader` - Handles video download operations and configuration
+///
+/// # Errors
+/// Returns error if either:
+/// - Sheet processing fails
+/// - Local file processing fails
+/// - Task joining fails
+async fn run_application(downloader: &Downloader) -> Result<()> {
+    let mut tasks: Vec<futures::future::BoxFuture<'_, Result<()>>> = Vec::new();
 
-    // Extract video ID from URL
-    let video_id = url.split('/').last().unwrap_or_default();
+    // Process Google Sheet if configured
+    if let Some(sheet_url) = &downloader.config().sheet_url {
+        let sheet_client = SheetClient::new();
+        // tasks.push(Box::pin());
+        process_sheet(downloader, sheet_client, sheet_url).await;
+    }
+
+    // Process local files
+    // tasks.push(Box::pin(process_local_files(downloader)));
+    process_local_files(downloader).await;
     
-    // Create filenames using video ID
-    let audio_filename = format!("{}.mp3", video_id);
-    let video_filename = format!("{}.mp4", video_id);
-    let output_filename = format!("ytb_{}_{}.mp4", index, video_id);
 
-    // Download audio
-    if let Some(audio_format) = video.best_audio_format() {
-        fetcher
-            .download_format(&audio_format, &audio_filename)
-            .await?;
-    }
-
-    // Download video
-    if let Some(video_format) = video.best_video_format() {
-        fetcher
-            .download_format(&video_format, &video_filename)
-            .await?;
-    }
-
-    // Combine audio and video
-    fetcher
-        .combine_audio_and_video(&audio_filename, &video_filename, &output_filename)
-        .await?;
-
-    // Clean up temporary files from output directory
-    if let Err(e) = std::fs::remove_file(format!("output/{}", &audio_filename)) {
-        eprintln!("Warning: Could not delete temporary audio file: {}", e);
-    }
-    if let Err(e) = std::fs::remove_file(format!("output/{}", &video_filename)) {
-        eprintln!("Warning: Could not delete temporary video file: {}", e);
-    }
-
+    // Run all tasks concurrently
+    futures::future::try_join_all(tasks).await?;
     Ok(())
 }
 
-fn read_urls(path: &PathBuf) -> io::Result<Vec<String>> {
+/// Processes video URLs from a Google Sheet source.
+///
+/// # Processing Steps
+/// 1. Fetches URLs from the provided Google Sheet
+/// 2. Downloads videos for all valid URLs
+///
+/// # Arguments
+/// * `downloader` - Handles video download operations
+/// * `sheet_client` - Manages Google Sheet interactions
+/// * `sheet_url` - Complete URL to the Google Sheet
+///
+/// # Errors
+/// Returns error if:
+/// - Sheet URL is invalid
+/// - Sheet access fails
+/// - URL fetching fails
+/// - Video downloading fails
+async fn process_sheet(
+    downloader: &Downloader,
+    sheet_client: SheetClient,
+    sheet_url: &String,
+) -> Result<()> {
+    let urls = sheet_client.fetch_urls(&sheet_url).await?;
+    let reuslt = downloader.process_urls(&urls).await?;
+    Ok(reuslt)
+}
+
+/// Processes video URLs from local text files.
+///
+/// # Processing Steps
+/// 1. Reads the input directory
+/// 2. Processes each .txt file found
+/// 3. Downloads videos from URLs in each file
+///
+/// # Arguments
+/// * `downloader` - Handles video download operations and configuration
+///
+/// # Errors
+/// Returns error if:
+/// - Directory reading fails
+/// - File reading fails
+/// - URL parsing fails
+/// - Video downloading fails
+async fn process_local_files(downloader: &Downloader) -> Result<()> {
+    // Then process local files
+    let input_dir = &downloader.config().input_dir;
+    let entries = std::fs::read_dir(input_dir)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("txt") {
+            println!("Processing file: {:?}", path);
+            let urls = read_urls(&path).await?;
+            let reuslt = downloader.process_urls(&urls).await?;
+            return Ok(reuslt);
+        }
+    }
+    Ok(())
+}
+
+/// Reads and validates URLs from a text file.
+///
+/// # Format
+/// - One URL per line
+/// - Empty lines are ignored
+/// - Lines are trimmed of whitespace
+///
+/// # Arguments
+/// * `path` - Path to the text file containing URLs
+///
+/// # Returns
+/// A vector of validated URLs as strings
+///
+/// # Errors
+/// Returns error if:
+/// - File cannot be opened
+/// - File reading fails
+/// - Line parsing fails
+async fn read_urls(path: &PathBuf) -> Result<Vec<String>> {
     let file = File::open(path)?;
     let reader = io::BufReader::new(file);
     let mut urls = Vec::new();
@@ -213,95 +162,4 @@ fn read_urls(path: &PathBuf) -> io::Result<Vec<String>> {
     }
 
     Ok(urls)
-}
-
-async fn first_check() -> Result<Youtube, yt_dlp::error::Error> {
-    let output_dir = PathBuf::from("output");
-    let input_dir = PathBuf::from("input");
-    let libraries_dir = PathBuf::from("libs");
-    let fetcher;
-
-    // Create directories if they don't exist
-    for dir in [&output_dir, &input_dir, &libraries_dir] {
-        if !dir.exists() {
-            std::fs::create_dir_all(dir)?;
-        }
-    }
-
-    // Check if any .txt file exists in input directory
-    let has_txt_file = std::fs::read_dir(&input_dir)?
-        .filter_map(|entry| entry.ok())
-        .any(|entry| {
-            entry
-                .path()
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map_or(false, |ext| ext == "txt")
-        });
-
-    // Create videos.txt if no .txt files exist
-    if !has_txt_file {
-        let videos_file = input_dir.join("videos.txt");
-        std::fs::File::create(&videos_file)?;
-        println!("Created videos.txt file in input directory");
-    }
-
-    if !libraries_dir.join("yt-dlp").exists() || !libraries_dir.join("ffmpeg").exists() {
-        fetcher = Youtube::with_new_binaries(libraries_dir.clone(), output_dir).await?;
-    } else {
-        let youtube = libraries_dir.join("yt-dlp");
-        let ffmpeg = libraries_dir.join("ffmpeg");
-        let libraries = Libraries::new(youtube, ffmpeg);
-        fetcher = Youtube::new(libraries, output_dir)?;
-        fetcher.update_downloader().await?;
-    }
-
-    Ok(fetcher)
-}
-
-// New function to handle URL processing
-async fn process_urls(
-    fetcher: &Arc<Youtube>,
-    semaphore: &Arc<Semaphore>,
-    urls: Vec<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let total_videos = urls.len();
-    println!("Found {} videos to download", total_videos);
-    let progress = Arc::new(Mutex::new(DownloadProgress::new(total_videos)));
-
-    let download_tasks = stream::iter(urls.into_iter().enumerate())
-        .map(|(index, url)| {
-            let fetcher = Arc::clone(fetcher);
-            let sem = Arc::clone(semaphore);
-            let progress = Arc::clone(&progress);
-            
-            async move {
-                let _permit = sem.acquire().await.unwrap();
-                println!("Starting download for video {}", index + 1);
-                
-                let start = Instant::now();
-                let result = download_video(&fetcher, url.clone(), index).await;
-                let duration = start.elapsed();
-                
-                let success = result.is_ok();
-                progress.lock().await.update(success);
-                
-                match result {
-                    Ok(_) => println!("Video {} completed in {:.1}s", index + 1, duration.as_secs_f64()),
-                    Err(e) => eprintln!("Failed to download video {}: {}", index + 1, e),
-                }
-            }
-        })
-        .buffer_unordered(10);
-
-    download_tasks.collect::<Vec<_>>().await;
-    
-    // Print final statistics
-    let final_progress = progress.lock().await;
-    println!("\nDownload Summary:");
-    println!("Total time: {:.1}s", final_progress.start_time.elapsed().as_secs_f64());
-    println!("Successfully downloaded: {}", final_progress.completed - final_progress.errors);
-    println!("Failed downloads: {}", final_progress.errors);
-
-    Ok(())
 }
